@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+set -u
+
+PORT=64887
+SERVER='https://mcp.atlassian.com/v1/sse'
+URL=''
+AUTH_PROMPT=0
+SHOW_INTERNALS=0
+COMPLETED=0
+FAILURE=''
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/auth-jira-mcp.XXXXXX")
+OUTPUT="$TMP_DIR/output"
+touch "$OUTPUT"
+
+cleanup() {
+  local status=$?
+  trap - EXIT INT TERM
+  if [[ -n "${MCP_PID:-}" ]] && kill -0 "$MCP_PID" 2>/dev/null; then
+    kill "$MCP_PID" 2>/dev/null || true
+    wait "$MCP_PID" 2>/dev/null || true
+  fi
+  rm -rf "$TMP_DIR"
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+copy_url() {
+  [[ -n "$URL" ]] || return 1
+  if command -v xsel >/dev/null 2>&1 && xsel --clipboard --input 2>/dev/null <<<"$URL"; then
+    COPY_METHOD='system clipboard (xsel)'
+  elif command -v xclip >/dev/null 2>&1 && xclip -selection clipboard 2>/dev/null <<<"$URL"; then
+    COPY_METHOD='system clipboard (xclip)'
+  elif command -v wl-copy >/dev/null 2>&1 && wl-copy 2>/dev/null <<<"$URL"; then
+    COPY_METHOD='system clipboard (wl-copy)'
+  elif command -v pbcopy >/dev/null 2>&1 && pbcopy 2>/dev/null <<<"$URL"; then
+    COPY_METHOD='system clipboard (pbcopy)'
+  else
+    local encoded
+    encoded=$(printf '%s' "$URL" | base64 | tr -d '\n')
+    [[ -t 1 ]] || return 1
+    printf '\033]52;c;%s\a' "$encoded" > /dev/tty 2>/dev/null || return 1
+    COPY_METHOD='terminal clipboard (OSC52)'
+  fi
+}
+
+process_line() {
+  local line=$1
+  [[ "$SHOW_INTERNALS" == 1 ]] && printf '\n  %s' "$line"
+
+  if [[ -z "$URL" && "$line" == *'Please authorize this client by visiting:'* ]]; then
+    AUTH_PROMPT=1
+    return
+  fi
+
+  if [[ -z "$URL" && "$AUTH_PROMPT" == 1 ]]; then
+    AUTH_PROMPT=0
+    if [[ "$line" =~ (https?://[^[:space:]]+\?[^[:space:]]+) ]]; then
+      URL="${BASH_REMATCH[1]}"
+      printf '\n\n Authorization URL:\n %s\n' "$URL"
+      if copy_url; then echo " Authorization URL copied to clipboard via $COPY_METHOD."; else echo ' Could not access a clipboard.'; fi
+      echo ' Open the URL in your browser and complete the authorization.'
+      echo ' Press c to copy again.'
+    fi
+  fi
+
+  if [[ "$line" == *'Press Ctrl+C to exit'* ]]; then
+    COMPLETED=1
+  elif [[ "$line" == *'Fatal error:'* || "$line" == *'Callback port '* || "$line" == *'Another instance is running the sign-in'* ]]; then
+    FAILURE="$line"
+  fi
+}
+
+drain_output() {
+  local size
+  size=$(wc -c < "$OUTPUT")
+  (( size > offset )) || return
+  while IFS= read -r line; do
+    process_line "$line"
+  done < <(tail -c +$((offset + 1)) "$OUTPUT")
+  offset=$size
+}
+
+echo ' Jira MCP authentication'
+echo ' ─────────────────────────────────────────────'
+echo ' Cleaning old Jira MCP processes...'
+while read -r pid; do
+  [[ -z "$pid" ]] || kill "$pid" 2>/dev/null || true
+done < <(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
+pkill -f 'mcp-remote.*mcp\.atlassian\.com' 2>/dev/null || true
+for _ in {1..20}; do
+  lsof -tiTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || break
+  sleep 0.1
+done
+
+echo ' Starting authentication...'
+echo ' Keys: c = copy URL   i = toggle internals   Ctrl-C = cancel'
+npx mcp-remote "$SERVER" "$PORT" >"$OUTPUT" 2>&1 < /dev/tty &
+MCP_PID=$!
+
+offset=0
+while :; do
+  drain_output
+  if [[ "$COMPLETED" == 1 ]]; then
+    echo
+    echo ' Success: Jira MCP authorization completed.'
+    exit 0
+  fi
+  kill -0 "$MCP_PID" 2>/dev/null || break
+  if IFS= read -r -s -n 1 -t 1 key < /dev/tty; then
+    case "$key" in
+      c|C) if copy_url; then echo " Authorization URL copied to clipboard via $COPY_METHOD."; else echo ' Could not access a clipboard.'; fi ;;
+      i|I) SHOW_INTERNALS=$((1 - SHOW_INTERNALS));
+           [[ "$SHOW_INTERNALS" == 1 ]] && echo; echo " Internals: $([[ "$SHOW_INTERNALS" == 1 ]] && echo visible || echo hidden)." ;;
+    esac
+  fi
+done
+
+wait "$MCP_PID"; status_code=$?
+drain_output
+if [[ "$COMPLETED" == 1 ]]; then
+  echo
+  echo ' Success: Jira MCP authorization completed.'
+  exit 0
+fi
+if [[ -n "$FAILURE" ]]; then
+  echo " Error: $FAILURE" >&2
+elif [[ $status_code -ne 0 ]]; then
+  echo " Error: Jira MCP authentication failed (exit status $status_code). Press i on a retry to view internals." >&2
+else
+  echo ' Error: authentication ended before completing. Press i on a retry to view internals.' >&2
+fi
+exit "$status_code"
